@@ -3,13 +3,19 @@ import os
 import uuid
 from pathlib import Path
 
-DEFAULTS = {'record_hotkey': 'F6', 'play_hotkey': 'F8', 'stop_hotkey': 'F10', 'auto_update': True}
+DEFAULTS = {'record_hotkey': 'F6', 'play_hotkey': 'F8', 'stop_hotkey': 'F10', 'auto_update': True, 'mouse_coordinates': True}
 
 
 def validate_macro(m):
     if not isinstance(m, dict) or not isinstance(m.get('name'), str) or not m['name'].strip():
         raise ValueError('У макроса должно быть имя')
     events = m.get('events')
+    if m.get('mouse_mode','absolute') not in ('absolute','relative'):
+        raise ValueError('Неверный режим координат мыши')
+    if 'mouse_start' in m:
+        start = m['mouse_start']
+        if not isinstance(start,dict) or any(type(start.get(k)) is not int or abs(start[k])>1_000_000 for k in ('x','y')):
+            raise ValueError('Неверная начальная координата мыши')
     if not isinstance(events, list) or len(events) > 1_000_000:
         raise ValueError('Неверный список событий')
     previous = 0

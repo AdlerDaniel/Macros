@@ -41,12 +41,25 @@ def run_tests(output):
             time.sleep(.005)
 
     def focus():
+        window.poll()
         target.show()
         target.raise_()
         target.activateWindow()
         engine.user.SetForegroundWindow(c.c_void_p(int(target.winId())))
         edit.setFocus()
         pump(.2)
+        # Completion notifications may restore the main window while events are being pumped.
+        engine.user.SetForegroundWindow(c.c_void_p(int(target.winId())))
+        target.activateWindow()
+        edit.setFocus()
+        app.processEvents()
+
+    def wait_playback():
+        deadline = time.monotonic()+3
+        while engine.mode!='idle' and time.monotonic()<deadline:
+            pump(.01)
+        assert engine.mode=='idle'
+        pump(.06)
 
     def key(vk,down):
         packet = INPUT(type=1,ki=KEYINPUT(vk,0,0 if down else 2,0,0))
@@ -148,7 +161,7 @@ def run_tests(output):
             {'kind':'button','x':click_pos.x(),'y':click_pos.y(),'button':'left','down':True,'t':.02},
             {'kind':'button','x':click_pos.x(),'y':click_pos.y(),'button':'left','down':False,'t':.04}]}
         engine.play(click_macro)
-        pump(.5)
+        wait_playback()
         assert len(clicks)==3,len(clicks)
         report['passed'].append('Mouse replay clicks a real target three times')
         # Own replay events must never activate control hotkeys.
@@ -160,9 +173,81 @@ def run_tests(output):
             {'kind':'key','vk':65,'down':False,'t':.1}]}
         before = len(edit.text())
         engine.play(guarded)
-        pump(.4)
-        assert len(edit.text())==before+1
+        wait_playback()
+        assert len(edit.text())==before+1,(before,edit.text(),QApplication.focusWidget())
         report['passed'].append('Replayed control keys do not trigger global hotkeys')
+        # Preserve a rapid burst of native pixel samples instead of coalescing them away.
+        path_start = edit.mapToGlobal(edit.rect().center())
+        engine.user.SetCursorPos(path_start.x(),path_start.y())
+        engine.record(keyboard=False,mouse=True)
+        left,top = engine.user.GetSystemMetrics(76),engine.user.GetSystemMetrics(77)
+        width,height = engine.user.GetSystemMetrics(78),engine.user.GetSystemMetrics(79)
+        packets = (INPUT*100)()
+        for i in range(100):
+            x = ((path_start.x()+i+1-left)*65536+32768)//width
+            y = ((path_start.y()-top)*65536+32768)//height
+            packets[i] = INPUT(type=0,mi=MOUSEINPUT(x,y,0,0xE001,0,0))
+        assert engine.user.SendInput(100,packets,c.sizeof(INPUT))==100
+        pump(.15)
+        recorded_path = engine.finish_record()
+        assert len(recorded_path)==101,len(recorded_path)
+        assert [(e['x'],e['y']) for e in recorded_path]==[(path_start.x()+i,path_start.y()) for i in range(101)]
+        report['passed'].append('100 rapid native mouse samples preserved without losing any pixels')
+        # Observe the actual Windows cursor after each playback injection, including resets.
+        observed = []
+        engine.mouse_observer = lambda x,y,t:observed.append((x,y,t))
+        smooth = {'name':'Pixel path','mouse_mode':'absolute','mouse_start':{'x':path_start.x(),'y':path_start.y()},
+            'events':[{'kind':'move','x':path_start.x()+100,'y':path_start.y()+20,'t':.016}],
+            'repeats':2,'speed':1,'gap':.03}
+        engine.user.SetCursorPos(path_start.x()-50,path_start.y()-50)
+        playback_started = time.perf_counter()
+        engine.play(smooth)
+        deadline = time.monotonic()+3
+        while engine.mode!='idle' and time.monotonic()<deadline:
+            pump(.01)
+        pump(.05)
+        report['pixel_playback_duration'] = time.perf_counter()-playback_started
+        assert engine.mode=='idle'
+        assert len(observed)==202,len(observed)
+        assert observed[0][:2]==observed[101][:2]==(path_start.x(),path_start.y())
+        assert observed[100][:2]==observed[201][:2]==(path_start.x()+100,path_start.y()+20)
+        assert all(max(abs(b[0]-a[0]),abs(b[1]-a[1]))==1 for a,b in zip(observed[:100],observed[1:101]))
+        report['mouse_pixel_observations'] = len(observed)
+        report['passed'].append('Actual cursor follows every pixel and returns to recorded start for each repeat')
+        # Relative playback starts at the current cursor and continues from the previous endpoint.
+        observed.clear()
+        relative_start = (path_start.x()-30,path_start.y()-30)
+        engine.user.SetCursorPos(*relative_start)
+        relative = {'name':'Relative path','mouse_mode':'relative','events':[{'kind':'move','x':10,'y':5,'t':.012}],
+            'repeats':2,'speed':1,'gap':.03}
+        engine.play(relative)
+        wait_playback()
+        assert len(observed)==22,len(observed)
+        assert observed[0][:2]==relative_start
+        assert observed[11][:2]==(relative_start[0]+10,relative_start[1]+5)
+        assert engine.cursor_position()==(relative_start[0]+20,relative_start[1]+10)
+        engine.mouse_observer = None
+        report['passed'].append('Relative mouse playback starts from current cursor with no return to recorded coordinates')
+        engine.play(smooth)
+        deadline = time.monotonic()+3
+        while engine.mode!='idle' and time.monotonic()<deadline:
+            pump(.01)
+        assert engine.mode=='idle'
+        assert engine.cursor_position()==(path_start.x()+100,path_start.y()+20)
+        report['native_playback_duration'] = engine.playback_elapsed
+        assert engine.playback_elapsed < .18,engine.playback_elapsed
+        assert engine.hook_handles[1]
+        report['passed'].append('Uninstrumented mouse playback keeps timing and restores capture hook')
+        from ui import Settings
+        settings = Settings(window)
+        settings.coordinates.setChecked(False)
+        settings.save()
+        assert not settings.error.text()
+        assert not window.coordinates_btn.isChecked()
+        assert Store(root).data['settings']['mouse_coordinates'] is False
+        window.coordinates_btn.setChecked(True)
+        assert Store(root).data['settings']['mouse_coordinates'] is True
+        report['passed'].append('Coordinate setting persists and synchronizes settings dialog with toolbar')
         # Reassign all controls, start/stop with a modifier chord and verify trimming.
         window.hotkeys.configure({1:'Ctrl+Alt+Shift+F12',2:'F9',3:'F11'})
         window.store.data['settings'].update(record_hotkey='Ctrl+Alt+Shift+F12',play_hotkey='F9',stop_hotkey='F11')
@@ -188,7 +273,7 @@ def run_tests(output):
         pump(.2)
         assert engine.mode=='idle'
         reassigned = window.current()
-        assert {e.get('vk') for e in reassigned['events']}=={65}
+        assert {e.get('vk') for e in reassigned['events'] if e['kind']=='key'}=={65}
         report['passed'].append('Reassigned modifier hotkeys work and entire stop chord is removed')
         window.hotkeys.configure({1:'F6',2:'F8',3:'F10'})
         window.store.data['settings'].update(record_hotkey='F6',play_hotkey='F8',stop_hotkey='F10')

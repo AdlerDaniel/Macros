@@ -1,6 +1,7 @@
 """Windows low-level input hooks and interruptible, timestamped playback."""
 import ctypes as c
 from ctypes import wintypes as w
+import heapq
 import queue
 import threading
 import time
@@ -43,9 +44,79 @@ class INPUT(c.Structure):
     _fields_ = [('type', w.DWORD), ('u', INPUTUNION)]
 
 
+class PlaybackClock:
+    """High-resolution Windows waits, with cancellation checked at least every 4 ms."""
+    def __init__(self, stop):
+        self.stop = stop
+        self.kernel = c.WinDLL('kernel32', use_last_error=True)
+        self.kernel.CreateWaitableTimerExW.restype = c.c_void_p
+        self.kernel.CreateWaitableTimerExW.argtypes = [c.c_void_p,w.LPCWSTR,w.DWORD,w.DWORD]
+        self.kernel.SetWaitableTimer.argtypes = [c.c_void_p,c.POINTER(c.c_longlong),w.LONG,c.c_void_p,c.c_void_p,w.BOOL]
+        self.kernel.WaitForSingleObject.argtypes = [c.c_void_p,w.DWORD]
+        self.kernel.CloseHandle.argtypes = [c.c_void_p]
+        self.timer = self.kernel.CreateWaitableTimerExW(None,None,2,0x100002)
+        self.winmm = c.WinDLL('winmm')
+        self.period = self.winmm.timeBeginPeriod(1)==0
+
+    def until(self, deadline):
+        while not self.stop.is_set():
+            remaining = deadline-time.perf_counter()
+            if remaining <= 0:
+                return True
+            delay = min(remaining,.004)
+            due = c.c_longlong(-max(1,round(delay*10_000_000)))
+            if self.timer and self.kernel.SetWaitableTimer(self.timer,c.byref(due),0,None,None,False):
+                self.kernel.WaitForSingleObject(self.timer,100)
+            else:
+                self.stop.wait(delay)
+        return False
+
+    def close(self):
+        if self.timer:
+            self.kernel.CloseHandle(self.timer)
+        if self.period:
+            self.winmm.timeEndPeriod(1)
+
+
+def playback_events(macro, anchor=None):
+    """Merge keys and pixel-by-pixel mouse segments without changing event order or pauses."""
+    events = macro['events']
+    first = next((e for e in events if e['kind']!='key'),None)
+    if first is None:
+        yield from events
+        return
+    relative = macro.get('mouse_mode','absolute')=='relative'
+    offset_x,offset_y = anchor if relative else (0,0)
+    origin = {'x':0,'y':0} if relative else macro.get('mouse_start',first)
+
+    def mouse_track():
+        px,py = origin['x'],origin['y']
+        previous_t = 0
+        yield (0,-1,{'kind':'move','x':px+offset_x,'y':py+offset_y,'t':0})
+        for index,e in enumerate(events):
+            if e['kind']=='key':
+                continue
+            dx,dy = e['x']-px,e['y']-py
+            steps = max(abs(dx),abs(dy))
+            # A long silent interval is a pause, not a slow movement across the screen.
+            begin = previous_t if e['t']-previous_t <= .02 else max(previous_t,e['t']-.008)
+            for step in range(1,steps+1):
+                x,y = px+round(dx*step/steps),py+round(dy*step/steps)
+                t = begin+(e['t']-begin)*step/steps
+                yield (t,index,{'kind':'move','x':x+offset_x,'y':y+offset_y,'t':t})
+            if e['kind']!='move' or (not steps and e['t']>0):
+                yield (e['t'],index,{**e,'x':e['x']+offset_x,'y':e['y']+offset_y})
+            px,py,previous_t = e['x'],e['y'],e['t']
+
+    keys = ((e['t'],index,e) for index,e in enumerate(events) if e['kind']=='key')
+    for _,_,event in heapq.merge(keys,mouse_track(),key=lambda row:(row[0],row[1])):
+        yield event
+
+
 def balanced(events):
     """Drop orphan releases and close held inputs at the end of a recording."""
     result, held = [], {}
+    last_mouse = None
     for event in events:
         e = dict(event)
         if e['kind'] in ('key', 'button'):
@@ -57,9 +128,14 @@ def balanced(events):
             else:
                 held.pop(identity)
         result.append(e)
+        if e['kind']!='key':
+            last_mouse = (e['x'],e['y'])
     end = result[-1]['t'] if result else 0
     for e in held.values():
-        result.append({**e, 'down': False, 't': end})
+        release = {**e, 'down': False, 't': end}
+        if e['kind']=='button' and last_mouse:
+            release.update(x=last_mouse[0],y=last_mouse[1])
+        result.append(release)
     return result
 
 
@@ -77,6 +153,8 @@ class Engine:
         self.kernel.GetModuleHandleW.restype = c.c_void_p
         self.kernel.GetModuleHandleW.argtypes = [w.LPCWSTR]
         self.accept_injected = accept_injected
+        self.mouse_observer = None
+        self.mouse_bounds = None
         self.messages = queue.SimpleQueue()
         self.lock = threading.RLock()
         self.mode = 'idle'
@@ -102,6 +180,8 @@ class Engine:
         module = self.kernel.GetModuleHandleW(None)
         handles = [self.user.SetWindowsHookExW(13, self.key_callback, module, 0),
                    self.user.SetWindowsHookExW(14, self.mouse_callback, module, 0)]
+        self.hook_handles = handles
+        self.mouse_resumed = threading.Event()
         msg = w.MSG()
         self.user.PeekMessageW(c.byref(msg), None, 0, 0, 0)
         if not all(handles):
@@ -110,12 +190,34 @@ class Engine:
         try:
             if not self.hook_error:
                 while self.user.GetMessageW(c.byref(msg), None, 0, 0) > 0:
+                    if msg.message==0x8001:
+                        if not handles[1]:
+                            handles[1] = self.user.SetWindowsHookExW(14,self.mouse_callback,module,0)
+                        self.mouse_resumed.set()
+                        continue
                     self.user.TranslateMessage(c.byref(msg))
                     self.user.DispatchMessageW(c.byref(msg))
         finally:
             for handle in handles:
                 if handle:
                     self.user.UnhookWindowsHookEx(handle)
+
+    def _suspend_mouse_hook(self):
+        # Capture and playback are mutually exclusive. Avoid a Python hook round-trip for every
+        # synthetic pixel; keyboard hooks remain active for immediate physical stop hotkeys.
+        if self.mouse_observer:
+            return False
+        handle = self.hook_handles[1]
+        if handle and self.user.UnhookWindowsHookEx(handle):
+            self.hook_handles[1] = None
+            return True
+        return False
+
+    def _resume_mouse_hook(self):
+        self.mouse_resumed.clear()
+        self.user.PostThreadMessageW(self.thread_id,0x8001,0,0)
+        if not self.mouse_resumed.wait(3) or not self.hook_handles[1]:
+            self.messages.put(('error','Не удалось восстановить запись мыши'))
 
     def _key_hook(self, code, message, pointer):
         if code >= 0:
@@ -137,14 +239,13 @@ class Engine:
     def _mouse_hook(self, code, message, pointer):
         if code >= 0:
             m = c.cast(pointer, c.POINTER(MOUSEHOOK)).contents
+            if self.accept_injected and self.mouse_observer and m.extra==MAGIC and message==0x200:
+                self.mouse_observer(m.pt.x,m.pt.y,time.perf_counter())
             if m.extra != MAGIC and (self.accept_injected or not m.flags & 1):
                 with self.lock:
                     if self.mode == 'recording' and self.capture_mouse:
                         e = {'x': m.pt.x, 'y': m.pt.y}
                         if message == 0x200:
-                            # Coalesce only adjacent movement, preserving clicks and their order.
-                            if self.events and self.events[-1]['kind'] == 'move' and time.perf_counter()-self.started-self.events[-1]['t'] < .008:
-                                self.events.pop()
                             e['kind'] = 'move'
                         elif message in (0x201, 0x202, 0x204, 0x205, 0x207, 0x208, 0x20B, 0x20C):
                             e.update(kind='button', button={0x201:'left',0x202:'left',0x204:'right',0x205:'right',0x207:'middle',0x208:'middle'}.get(message, 'x1' if m.data >> 16 == 1 else 'x2'), down=message in (0x201,0x204,0x207,0x20B))
@@ -152,6 +253,9 @@ class Engine:
                             e.update(kind='scroll', delta=c.c_short(m.data >> 16).value, horizontal=message == 0x20E)
                         else:
                             return self.user.CallNextHookEx(None, code, message, pointer)
+                        if not self.record_coordinates:
+                            e['x'] -= self.record_origin[0]
+                            e['y'] -= self.record_origin[1]
                         self._append(e)
         return self.user.CallNextHookEx(None, code, message, pointer)
 
@@ -164,12 +268,26 @@ class Engine:
             return
         self.events.append({**event, 't': t})
 
-    def record(self, keyboard=True, mouse=True):
+    def cursor_position(self):
+        point = POINT()
+        if not self.user.GetCursorPos(c.byref(point)):
+            raise RuntimeError('Не удалось получить координаты мыши')
+        return point.x,point.y
+
+    def record(self, keyboard=True, mouse=True, mouse_coordinates=True):
         with self.lock:
             if self.mode != 'idle' or not (keyboard or mouse):
                 raise ValueError('Запись сейчас недоступна')
             self.events = []
             self.limit_reported = False
+            self.record_coordinates = mouse_coordinates
+            self.record_origin = self.cursor_position() if mouse else (0,0)
+            self.record_options = {'mouse_mode':'absolute' if mouse_coordinates else 'relative'}
+            if mouse:
+                x,y = self.record_origin if mouse_coordinates else (0,0)
+                self.events.append({'kind':'move','x':x,'y':y,'t':0})
+                if mouse_coordinates:
+                    self.record_options['mouse_start'] = {'x':x,'y':y}
             self.started = time.perf_counter()
             self.capture_keyboard, self.capture_mouse = keyboard, mouse
             self.mode = 'recording'
@@ -192,17 +310,18 @@ class Engine:
             self.events = []
             return balanced(events)
 
-    def send(self, e):
+    def _packet(self, e):
         if e['kind'] == 'key':
             flags = (0 if e['down'] else 2) | (1 if e.get('extended') else 0)
             packet = INPUT(type=1, ki=KEYINPUT(e['vk'], e.get('scan', 0), flags, 0, MAGIC))
         else:
             # Absolute virtual desktop coordinates support monitors left of the primary display.
-            left, top = self.user.GetSystemMetrics(76), self.user.GetSystemMetrics(77)
-            width, height = self.user.GetSystemMetrics(78), self.user.GetSystemMetrics(79)
-            x = round((e['x']-left)*65535/max(1,width-1))
-            y = round((e['y']-top)*65535/max(1,height-1))
-            flags, data = 0x8000 | 0x4000 | 1, 0
+            bounds = self.mouse_bounds or tuple(self.user.GetSystemMetrics(i) for i in (76,77,78,79))
+            left,top,width,height = bounds
+            # Use the centre of each pixel's normalized range, avoiding one-pixel rounding drift.
+            x = min(65535,max(0,((e['x']-left)*65536+32768)//max(1,width)))
+            y = min(65535,max(0,((e['y']-top)*65536+32768)//max(1,height)))
+            flags, data = 0x8000 | 0x4000 | 0x2000 | 1, 0
             if e['kind'] == 'button':
                 flag = {'left':(2,4),'right':(8,16),'middle':(32,64),'x1':(128,256),'x2':(128,256)}[e['button']]
                 flags |= flag[0 if e['down'] else 1]
@@ -211,8 +330,24 @@ class Engine:
                 flags |= 0x1000 if e.get('horizontal') else 0x800
                 data = e['delta'] & 0xFFFFFFFF
             packet = INPUT(type=0, mi=MOUSEINPUT(x,y,data,flags,0,MAGIC))
+        return packet
+
+    def send(self, e):
+        packet = self._packet(e)
         if self.user.SendInput(1, c.byref(packet), c.sizeof(INPUT)) != 1:
             raise RuntimeError('Windows заблокировала ввод. Проверьте права целевой программы.')
+
+    def send_batch(self, events):
+        # Preserve every pixel in one OS call when its scheduled times are less than 0.5 ms apart.
+        packets = (INPUT*len(events))(*(self._packet(e) for e in events))
+        if self.user.SendInput(len(events),packets,c.sizeof(INPUT)) != len(events):
+            raise RuntimeError('Windows заблокировала ввод. Проверьте права целевой программы.')
+
+    def _release_input(self, event):
+        release = {**event,'down':False}
+        if event['kind']=='button':
+            release['x'],release['y'] = self.cursor_position()
+        self.send(release)
 
     def play(self, macro):
         from storage import validate_macro
@@ -228,22 +363,43 @@ class Engine:
     def _play(self, macro):
         held = {}
         count = 0
+        clock = None
+        mouse_suspended = False
+        play_started = time.perf_counter()
         try:
+            clock = PlaybackClock(self.stop_event)
+            mouse_suspended = self._suspend_mouse_hook()
+            if any(e['kind']!='key' for e in macro['events']):
+                self.mouse_bounds = tuple(self.user.GetSystemMetrics(i) for i in (76,77,78,79))
             while not self.stop_event.is_set() and (macro.get('repeats',1) == 0 or count < macro.get('repeats',1)):
+                has_mouse = any(e['kind']!='key' for e in macro['events'])
+                anchor = self.cursor_position() if has_mouse and macro.get('mouse_mode')=='relative' else None
                 start = time.perf_counter()
-                for e in macro['events']:
-                    delay = e['t']/macro.get('speed',1) - (time.perf_counter()-start)
-                    if self.stop_event.wait(max(0,delay)):
+                speed = macro.get('speed',1)
+                iterator = iter(playback_events(macro,anchor))
+                e = next(iterator,None)
+                while e is not None:
+                    batch = [e]
+                    following = next(iterator,None)
+                    if e['kind']=='move':
+                        while following is not None and following['kind']=='move' and len(batch)<64 and (following['t']-batch[0]['t'])/speed <= .0005:
+                            batch.append(following)
+                            following = next(iterator,None)
+                    if not clock.until(start+batch[-1]['t']/speed):
                         break
-                    self.send(e)
+                    if e['kind']=='move':
+                        self.send_batch(batch)
+                    else:
+                        self.send(e)
                     if e['kind'] in ('key','button'):
                         identity = (e['kind'], e.get('vk',e.get('button')))
                         if e['down']:
                             held[identity] = e
                         else:
                             held.pop(identity,None)
+                    e = following
                 for e in held.values():
-                    self.send({**e,'down':False})
+                    self._release_input(e)
                 held.clear()
                 if self.stop_event.is_set():
                     break
@@ -258,9 +414,15 @@ class Engine:
         finally:
             for e in held.values():
                 try:
-                    self.send({**e,'down':False})
+                    self._release_input(e)
                 except Exception:
                     pass
+            if clock:
+                clock.close()
+            self.playback_elapsed = time.perf_counter()-play_started
+            if mouse_suspended:
+                self._resume_mouse_hook()
+            self.mouse_bounds = None
             with self.lock:
                 self.mode = 'idle'
             self.messages.put(('finished',count))

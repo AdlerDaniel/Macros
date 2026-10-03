@@ -67,6 +67,10 @@ def mock_engine():
     e.stop_event = threading.Event()
     e.messages = queue.SimpleQueue()
     e.worker = None
+    e.send_batch = lambda events:[e.send(event) for event in events]
+    e._suspend_mouse_hook = lambda:False
+    e._resume_mouse_hook = lambda:None
+    e.user = type('MockUser',(),{'GetSystemMetrics':lambda self,index:{76:0,77:0,78:1920,79:1080}[index]})()
     return e
 
 

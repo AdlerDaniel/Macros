@@ -97,6 +97,10 @@ class Settings(QDialog):
         self.auto = QCheckBox('Обновлять при запуске')
         self.auto.setChecked(window.store.data['settings']['auto_update'])
         form.addRow(self.auto)
+        self.coordinates = QCheckBox('Учитывать координаты мыши при записи')
+        self.coordinates.setChecked(window.store.data['settings']['mouse_coordinates'])
+        self.coordinates.setToolTip('Включено: возврат в начальную точку перед каждым повтором.\nВыключено: движение от текущего положения курсора.')
+        form.addRow(self.coordinates)
         layout.addLayout(form)
         version = QLabel('Версия '+VERSION)
         version.setObjectName('caption')
@@ -116,12 +120,13 @@ class Settings(QDialog):
         values = {key:edit.keySequence().toString(QKeySequence.PortableText) for key,edit in self.fields.items()}
         try:
             self.window.hotkeys.configure({i+1:values[k] for i,k in enumerate(self.fields)})
-            self.window.store.data['settings'].update(values,auto_update=self.auto.isChecked())
+            self.window.store.data['settings'].update(values,auto_update=self.auto.isChecked(),mouse_coordinates=self.coordinates.isChecked())
             self.window.store.save()
         except (ValueError,OSError) as exc:
             self.error.setText(str(exc))
             return
         self.window.refresh_hints()
+        self.window.coordinates_btn.setChecked(self.coordinates.isChecked())
         self.accept()
 
 
@@ -250,6 +255,11 @@ class Window(QMainWindow):
         self.mouse_btn.setChecked(True)
         controls.addWidget(self.keyboard_btn)
         controls.addWidget(self.mouse_btn)
+        self.coordinates_btn = button('crosshair','Учитывать координаты мыши при записи',True)
+        self.coordinates_btn.setToolTip('Координаты мыши при записи\nВключено: старт и каждый повтор из записанной точки.\nВыключено: движение относительно текущего курсора.')
+        self.coordinates_btn.setChecked(self.store.data['settings']['mouse_coordinates'])
+        self.coordinates_btn.toggled.connect(self.save_coordinate_setting)
+        controls.addWidget(self.coordinates_btn)
         controls.addStretch()
         self.record_btn = button('circle','Запись',text='Запись')
         self.record_btn.clicked.connect(self.toggle_record)
@@ -345,6 +355,10 @@ class Window(QMainWindow):
             self.save()
         self.repeats.setEnabled(not self.forever.isChecked() and self.engine.mode=='idle')
 
+    def save_coordinate_setting(self, enabled):
+        self.store.data['settings']['mouse_coordinates'] = enabled
+        self.save()
+
     def save(self):
         try:
             self.store.save()
@@ -374,7 +388,7 @@ class Window(QMainWindow):
     def duplicate(self):
         m = self.current()
         if m:
-            self.store.add(m['name']+' · копия',json.loads(json.dumps(m['events'])),repeats=m['repeats'],speed=m['speed'],gap=m['gap'],clicker=m.get('clicker',False))
+            self.store.add(m['name']+' · копия',json.loads(json.dumps(m['events'])),repeats=m['repeats'],speed=m['speed'],gap=m['gap'],clicker=m.get('clicker',False),**{k:m[k] for k in ('mouse_mode','mouse_start') if k in m})
             self.populate(len(self.store.data['macros'])-1)
 
     def delete(self):
@@ -396,10 +410,12 @@ class Window(QMainWindow):
                 m = self.record_target
                 if m:
                     m['events'] = events
+                    m.pop('mouse_start',None)
+                    m.update(self.engine.record_options)
                     m.pop('clicker',None)
                     self.save()
                 else:
-                    self.store.add(f'Макрос {len(self.store.data["macros"])+1:02}',events)
+                    self.store.add(f'Макрос {len(self.store.data["macros"])+1:02}',events,**self.engine.record_options)
                     self.populate(len(self.store.data['macros'])-1)
             self.record_target = None
             self.showNormal()
@@ -420,7 +436,7 @@ class Window(QMainWindow):
         if not self.pending:
             return
         self.pending = False
-        self.engine.record(self.keyboard_btn.isChecked(),self.mouse_btn.isChecked())
+        self.engine.record(self.keyboard_btn.isChecked(),self.mouse_btn.isChecked(),self.coordinates_btn.isChecked())
         self.refresh()
 
     def toggle_play(self, checked=False):
@@ -480,6 +496,7 @@ class Window(QMainWindow):
         busy = mode!='idle' or self.pending
         m = self.current()
         self.state.setText('Подготовка…' if self.pending else {'idle':'Готово','recording':'Запись','playing':'Воспроизведение'}[mode])
+        self.preview.setToolTip(('Относительное движение: каждый повтор от текущего курсора' if m.get('mouse_mode')=='relative' else 'Абсолютные координаты: каждый повтор из начальной точки') if m else '')
         self.record_btn.setText('Стоп' if mode=='recording' else 'Запись')
         self.record_btn.setObjectName('recording' if mode=='recording' else '')
         self.record_btn.setIcon(icon('square' if mode=='recording' else 'circle','#ffafbb' if mode=='recording' else '#c4cad7'))
@@ -489,7 +506,7 @@ class Window(QMainWindow):
         self.play_btn.setIcon(icon('square' if mode=='playing' else 'play','#12372b'))
         self.record_btn.setEnabled(mode!='playing')
         self.play_btn.setEnabled(mode!='recording' and bool(m and m['events']))
-        for control in (self.list,self.name,self.add_btn,self.clicker_btn,self.import_btn,self.settings_btn,self.keyboard_btn,self.mouse_btn,self.speed,self.gap,self.forever):
+        for control in (self.list,self.name,self.add_btn,self.clicker_btn,self.import_btn,self.settings_btn,self.keyboard_btn,self.mouse_btn,self.coordinates_btn,self.speed,self.gap,self.forever):
             control.setEnabled(not busy)
         self.name.setEnabled(not busy and bool(m))
         self.repeats.setEnabled(not busy and not self.forever.isChecked())
@@ -548,7 +565,8 @@ class Window(QMainWindow):
         interval.setSuffix(' с')
         form.addRow('Имя',name)
         form.addRow('Интервал',interval)
-        info = QLabel('После «Создать» наведите мышь на точку.\nПозиция сохранится через 3 секунды.')
+        coordinates = self.coordinates_btn.isChecked()
+        info = QLabel('После «Создать» наведите мышь на точку.\nПозиция сохранится через 3 секунды.' if coordinates else 'Клики в текущем положении курсора.')
         form.addRow(info)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok|QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText('Создать')
@@ -565,14 +583,18 @@ class Window(QMainWindow):
                     return
                 from engine import POINT
                 pt = POINT()
-                self.engine.user.GetCursorPos(ctypes.byref(pt))
+                if coordinates:
+                    self.engine.user.GetCursorPos(ctypes.byref(pt))
                 events = [{'kind':'button','x':pt.x,'y':pt.y,'button':'left','down':True,'t':0},
                           {'kind':'button','x':pt.x,'y':pt.y,'button':'left','down':False,'t':.01}]
-                self.store.add(name.text().strip() or 'Кликер',events,repeats=0,gap=max(.01,interval.value()-.01),clicker=True)
+                options = {'mouse_mode':'absolute' if coordinates else 'relative'}
+                if coordinates:
+                    options['mouse_start'] = {'x':pt.x,'y':pt.y}
+                self.store.add(name.text().strip() or 'Кликер',events,repeats=0,gap=max(.01,interval.value()-.01),clicker=True,**options)
                 self.pending = False
                 self.populate(len(self.store.data['macros'])-1)
                 self.showNormal()
-            QTimer.singleShot(3000,capture)
+            QTimer.singleShot(3000 if coordinates else 0,capture)
 
     def import_macro(self):
         path,_ = QFileDialog.getOpenFileName(self,'Импорт','','Macros (*.json)')
@@ -581,7 +603,7 @@ class Window(QMainWindow):
                 if Path(path).stat().st_size > 30_000_000:
                     raise ValueError('Файл больше 30 МБ')
                 m = validate_macro(json.loads(Path(path).read_text('utf-8')))
-                self.store.add(m['name'],m['events'],repeats=m.get('repeats',1),speed=m.get('speed',1),gap=m.get('gap',.2),clicker=m.get('clicker',False))
+                self.store.add(m['name'],m['events'],repeats=m.get('repeats',1),speed=m.get('speed',1),gap=m.get('gap',.2),clicker=m.get('clicker',False),**{k:m[k] for k in ('mouse_mode','mouse_start') if k in m})
                 self.populate(len(self.store.data['macros'])-1)
             except (OSError,ValueError,TypeError) as exc:
                 self.error('Не удалось импортировать: '+str(exc))
