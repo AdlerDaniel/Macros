@@ -126,6 +126,18 @@ def test_stopping_recorded_drag_releases_at_its_endpoint():
     assert result[-1]=={'kind':'button','button':'left','down':False,'x':30,'y':40,'t':1}
 
 
+def test_pixel_movement_does_not_wait_for_slow_injected_input_hooks():
+    e = mock_engine()
+    moved = []
+    e.accept_injected = False
+    e.mouse_observer = None
+    def unexpected_input(*args):
+        raise AssertionError('Pixel movement must not go through SendInput')
+    e.user = SimpleNamespace(SetCursorPos=lambda x,y:moved.append((x,y)) or 1,SendInput=unexpected_input)
+    Engine.send_batch(e,[{'kind':'move','x':i,'y':10,'t':i*.001} for i in range(5)])
+    assert moved==[(i,10) for i in range(5)]
+
+
 def test_recorded_coordinate_mode_survives_reload(tmp_path):
     s = Store(tmp_path)
     s.add('Relative',path_macro('relative')['events'],mouse_mode='relative')

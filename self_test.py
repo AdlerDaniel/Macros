@@ -7,8 +7,8 @@ import time
 
 
 def run_tests(output):
-    from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLineEdit, QPushButton
-    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout, QLineEdit, QPushButton, QSlider
+    from PySide6.QtCore import Qt, QPoint
     from ui import Window, STYLE
     from engine import Engine, INPUT, KEYINPUT, MOUSEINPUT, POINT
     from storage import Store
@@ -29,6 +29,9 @@ def run_tests(output):
     click = QPushButton('Test target')
     click.clicked.connect(lambda:clicks.append(1))
     layout.addWidget(click)
+    slider = QSlider(Qt.Horizontal)
+    slider.setRange(0,100)
+    layout.addWidget(slider)
     original = POINT()
     engine.user.GetCursorPos(c.byref(original))
     foreground = engine.user.GetForegroundWindow()
@@ -235,9 +238,25 @@ def run_tests(output):
         assert engine.mode=='idle'
         assert engine.cursor_position()==(path_start.x()+100,path_start.y()+20)
         report['native_playback_duration'] = engine.playback_elapsed
+        report['native_playback_setup_duration'] = engine.playback_setup_elapsed
+        report['native_playback_cycles'] = engine.playback_cycles
+        report['native_mouse_hook_suspended'] = engine.playback_mouse_hook_suspended
         assert engine.playback_elapsed < .18,engine.playback_elapsed
         assert engine.hook_handles[1]
         report['passed'].append('Uninstrumented mouse playback keeps timing and restores capture hook')
+        focus()
+        slider.setValue(0)
+        drag_start = slider.mapToGlobal(QPoint(8,slider.rect().center().y()))
+        drag_end = slider.mapToGlobal(QPoint(slider.width()-10,slider.rect().center().y()))
+        drag = {'name':'Drag','mouse_mode':'absolute','mouse_start':{'x':drag_start.x(),'y':drag_start.y()},
+            'repeats':1,'speed':1,'gap':0,'events':[
+                {'kind':'button','button':'left','down':True,'x':drag_start.x(),'y':drag_start.y(),'t':.01},
+                {'kind':'move','x':drag_end.x(),'y':drag_end.y(),'t':.31},
+                {'kind':'button','button':'left','down':False,'x':drag_end.x(),'y':drag_end.y(),'t':.32}]}
+        engine.play(drag)
+        wait_playback()
+        assert slider.value()>=90,slider.value()
+        report['passed'].append('Pixel playback drags a real Windows slider with held mouse button')
         from ui import Settings
         settings = Settings(window)
         settings.coordinates.setChecked(False)

@@ -3,6 +3,7 @@ import ctypes as c
 from ctypes import wintypes as w
 import heapq
 import queue
+import sys
 import threading
 import time
 
@@ -338,10 +339,17 @@ class Engine:
             raise RuntimeError('Windows заблокировала ввод. Проверьте права целевой программы.')
 
     def send_batch(self, events):
-        # Preserve every pixel in one OS call when its scheduled times are less than 0.5 ms apart.
-        packets = (INPUT*len(events))(*(self._packet(e) for e in events))
-        if self.user.SendInput(len(events),packets,c.sizeof(INPUT)) != len(events):
-            raise RuntimeError('Windows заблокировала ввод. Проверьте права целевой программы.')
+        # SendInput can block for several milliseconds per pixel in other global input hooks.
+        # SetCursorPos moves the actual cursor directly, while Windows still delivers mouse
+        # movement/drag messages. Clicks and wheel input continue to use SendInput.
+        for e in events:
+            if self.stop_event.is_set():
+                break
+            if not self.user.SetCursorPos(e['x'],e['y']):
+                raise RuntimeError('Windows заблокировала перемещение курсора')
+            if self.accept_injected and self.mouse_observer:
+                x,y = self.cursor_position()
+                self.mouse_observer(x,y,time.perf_counter())
 
     def _release_input(self, event):
         release = {**event,'down':False}
@@ -366,11 +374,17 @@ class Engine:
         clock = None
         mouse_suspended = False
         play_started = time.perf_counter()
+        previous_switch_interval = sys.getswitchinterval()
+        self.playback_cycles = []
         try:
+            # GUI mouse messages must not hold the GIL for the default 5 ms between pixel batches.
+            sys.setswitchinterval(.001)
             clock = PlaybackClock(self.stop_event)
             mouse_suspended = self._suspend_mouse_hook()
+            self.playback_mouse_hook_suspended = mouse_suspended
             if any(e['kind']!='key' for e in macro['events']):
                 self.mouse_bounds = tuple(self.user.GetSystemMetrics(i) for i in (76,77,78,79))
+            self.playback_setup_elapsed = time.perf_counter()-play_started
             while not self.stop_event.is_set() and (macro.get('repeats',1) == 0 or count < macro.get('repeats',1)):
                 has_mouse = any(e['kind']!='key' for e in macro['events'])
                 anchor = self.cursor_position() if has_mouse and macro.get('mouse_mode')=='relative' else None
@@ -401,6 +415,10 @@ class Engine:
                 for e in held.values():
                     self._release_input(e)
                 held.clear()
+                if getattr(self,'accept_injected',False):
+                    self.playback_cycles.append(time.perf_counter()-start)
+                    if len(self.playback_cycles)>128:
+                        self.playback_cycles.pop(0)
                 if self.stop_event.is_set():
                     break
                 count += 1
@@ -423,6 +441,7 @@ class Engine:
             if mouse_suspended:
                 self._resume_mouse_hook()
             self.mouse_bounds = None
+            sys.setswitchinterval(previous_switch_interval)
             with self.lock:
                 self.mode = 'idle'
             self.messages.put(('finished',count))

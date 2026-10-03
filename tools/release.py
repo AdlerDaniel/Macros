@@ -44,6 +44,11 @@ def release(version):
     command('git','commit','-m',f'Release Macros {version}')
     command('git','push','origin','main')
     tag = 'v'+version
+    # Publish the exact native EXE that passed Windows verification, rather than a new build.
+    # The workflow still checks/rebuilds the source and skips versions already published here.
+    head = command('git','rev-parse','HEAD',capture=True).stdout.strip()
+    command('gh','release','create',tag,'dist/Macros.exe','dist/update.json','dist/SHA256SUMS.txt',
+        '--target',head,'--title','Macros '+version,'--generate-notes')
     deadline = time.monotonic()+900
     while time.monotonic()<deadline:
         result = subprocess.run(['gh','release','view',tag,'--json','url,tagName,assets'],cwd=root,text=True,encoding='utf-8',capture_output=True)
