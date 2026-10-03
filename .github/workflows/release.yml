@@ -1,0 +1,45 @@
+name: Build and release Windows application
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Validate core
+        run: python -m pytest -q
+      - name: Build EXE and manifest
+        run: python tools/build.py
+      - name: Publish new version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $manifest = Get-Content dist/update.json -Raw | ConvertFrom-Json
+          $tag = "v$($manifest.version)"
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Version already published; increase VERSION for a new release."
+            exit 0
+          }
+          gh release create $tag dist/Macros.exe dist/update.json dist/SHA256SUMS.txt --target "${{ github.sha }}" --title "Macros $($manifest.version)" --generate-notes
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gh release view $tag --json tagName,assets,url
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Macros-Windows
+          path: dist/*
